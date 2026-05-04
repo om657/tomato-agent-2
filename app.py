@@ -22,7 +22,7 @@ NVIDIA_API_KEY = "nvapi-y32FIwatB-3aTPEwVt7h7XEwKWULrOx0XIlOaciLkxcuq2OdimsGbL5Z
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 MODEL_NAME = "mistralai/mistral-large-3-675b-instruct-2512"
 VISION_MODEL = "mistralai/mistral-large-3-675b-instruct-2512"
-REASONING_MODEL = "deepseek-ai/deepseek-v3.1-terminus"
+REASONING_MODEL = "deepseek-ai/deepseek-v4-flash"
 SARVAM_API_KEY = "sk_w2ff5un8_NwCt6eC0gfgjKezrySpjUCKn"
 SARVAM_TRANSLATE_URL = "https://api.sarvam.ai/translate"
 USER_DB = "users.json"
@@ -76,35 +76,82 @@ def _overpass_request(query: str, timeout_s: int = 15):
     return {"elements": []}
 
 
+# ---- Lightweight exclusion lists (only remove truly irrelevant) ---- #
+_SHOP_EXCLUDE = {
+    "atm", "bank", "fuel", "petrol", "gas station",
+}
+_DOCTOR_EXCLUDE = {
+    "atm", "bank", "fuel", "petrol", "gas station",
+    "restaurant", "hotel", "cafe",
+}
+
+
+def _should_exclude(name: str, tags: dict, actor: str) -> bool:
+    """Exclude only truly irrelevant places (ATMs, petrol pumps, etc.)."""
+    combined = (name.strip().lower() + " " +
+                " ".join(str(v).lower() for v in tags.values()))
+    exclude_set = _SHOP_EXCLUDE if actor.lower().startswith("shop") else _DOCTOR_EXCLUDE
+    return any(excl in combined for excl in exclude_set)
+
+
 @st.cache_data(show_spinner=False, ttl=60 * 5)
 def nearby_osm_places(lat: float, lon: float, actor: str, radius_m: int = 8000):
+    """Search OSM for shops or doctors/clinics near the given location."""
+
     if actor.lower().startswith("shop"):
+        # Search ALL shops + marketplaces + any node with agriculture-ish name
         selectors = [
-            'node["shop"="agrarian"](around:{r},{lat},{lon});',
-            'node["shop"="farm"](around:{r},{lat},{lon});',
-            'node["shop"="garden_centre"](around:{r},{lat},{lon});',
-            'node["shop"="hardware"](around:{r},{lat},{lon});',
-            'node["name"~"fertiliz|fertiliser|khad|urea|nursery",i](around:{r},{lat},{lon});',
-            'way["shop"="agrarian"](around:{r},{lat},{lon});',
-            'way["shop"="farm"](around:{r},{lat},{lon});',
-            'way["shop"="garden_centre"](around:{r},{lat},{lon});',
+            # ALL shops in the area (any type)
+            'node["shop"](around:{r},{lat},{lon});',
+            'way["shop"](around:{r},{lat},{lon});',
+            # Marketplaces / mandis
+            'node["amenity"="marketplace"](around:{r},{lat},{lon});',
+            'way["amenity"="marketplace"](around:{r},{lat},{lon});',
+            # Craft / trade
+            'node["craft"](around:{r},{lat},{lon});',
+            'way["craft"](around:{r},{lat},{lon});',
+            # Landuse retail
+            'way["landuse"="retail"](around:{r},{lat},{lon});',
         ]
     else:
+        # Search ALL medical facilities
         selectors = [
             'node["amenity"="doctors"](around:{r},{lat},{lon});',
             'node["amenity"="clinic"](around:{r},{lat},{lon});',
-            'node["healthcare"="doctor"](around:{r},{lat},{lon});',
+            'node["amenity"="hospital"](around:{r},{lat},{lon});',
+            'node["amenity"="pharmacy"](around:{r},{lat},{lon});',
+            'node["amenity"="veterinary"](around:{r},{lat},{lon});',
+            'node["healthcare"](around:{r},{lat},{lon});',
             'way["amenity"="doctors"](around:{r},{lat},{lon});',
             'way["amenity"="clinic"](around:{r},{lat},{lon});',
+            'way["amenity"="hospital"](around:{r},{lat},{lon});',
+            'way["amenity"="pharmacy"](around:{r},{lat},{lon});',
+            'way["amenity"="veterinary"](around:{r},{lat},{lon});',
+            'way["healthcare"](around:{r},{lat},{lon});',
         ]
 
+    results = _run_osm_search(lat, lon, selectors, radius_m, actor)
+
+    # Fallback: if too few results, auto-retry with bigger radius
+    if len(results) < 3 and radius_m < 30000:
+        results = _run_osm_search(lat, lon, selectors, min(radius_m * 2, 30000), actor)
+
+    # If still no results, try maximum radius
+    if not results and radius_m < 50000:
+        results = _run_osm_search(lat, lon, selectors, 50000, actor)
+
+    return results[:25]
+
+
+def _run_osm_search(lat, lon, selectors, radius_m, actor):
+    """Execute Overpass query and return filtered results."""
     q = (
-        "[out:json][timeout:15];("
+        "[out:json][timeout:25];("
         + "".join(s.format(r=radius_m, lat=lat, lon=lon) for s in selectors)
         + ");out center tags;"
     )
     try:
-        data = _overpass_request(q)
+        data = _overpass_request(q, timeout_s=25)
     except Exception:
         return []
     elements = data.get("elements", [])
@@ -119,6 +166,9 @@ def nearby_osm_places(lat: float, lon: float, actor: str, radius_m: int = 8000):
         tags = el.get("tags", {}) or {}
         name = tags.get("name") or tags.get("brand") or ""
         if not name or name.lower() == "unnamed":
+            continue
+        # Only exclude truly irrelevant (ATMs, petrol pumps)
+        if _should_exclude(name, tags, actor):
             continue
         # Deduplicate by name (case-insensitive)
         name_key = name.strip().lower()
@@ -136,7 +186,7 @@ def nearby_osm_places(lat: float, lon: float, actor: str, radius_m: int = 8000):
             }
         )
     results.sort(key=lambda x: x["distance_km"])
-    return results[:20]
+    return results
 
 
 def tomato_fertilizer_plan_text():
@@ -474,30 +524,57 @@ def call_openrouter(messages, model=REASONING_MODEL):
 
 def run_reasoning_model(image_bytes, species_info):
     base64_image = base64.b64encode(image_bytes).decode('utf-8')
-    
-    prompt = f"""
-    Analyze this plant image and the provided metadata. 
-    Metadata: {json.dumps(species_info)}
 
-    Identify:
-    1. The specific Crop/Plant name.
-    2. The most likely Disease or Health Issue (if any). If healthy, state 'Healthy'.
-    3. Local soil health trend (nutrients, pH, moisture) based on common conditions for the location and crop.
-    4. Water forecast & irrigation suggestions for the next 7 days.
-    5. Overall risk score (Low / Medium / High).
+    system_prompt = """You are a world-class plant pathologist and agronomist with 30 years of field experience.
+Your PRIMARY task is ACCURATE crop/plant identification followed by disease diagnosis.
 
-    Return ONLY valid JSON in this structure:
-    {{
-        "crop_name": "Name of the crop",
-        "disease_name": "Name of the disease or 'Healthy'",
-        "description": "Brief description of the crop and disease condition",
-        "solution": "Step-by-step solution to fix the issue or care instructions if healthy",
-        "fertilizers": "Recommended fertilizers or nutrients for this specific condition and crop",
-        "soil_insights": "Detailed soil health insights (nutrients, pH, moisture)",
-        "water_forecast": "Water forecast and irrigation plan",
-        "risk_score": "Low/Medium/High"
-    }}
-    """
+CRITICAL RULES FOR CROP IDENTIFICATION — follow these strictly:
+1. FIRST analyze the leaf morphology before naming ANY crop:
+   - Leaf shape (simple vs compound, lobed vs entire, serrated vs smooth margins)
+   - Leaf arrangement (alternate, opposite, whorled)
+   - Leaf texture (smooth, hairy/pubescent, waxy, sticky/glandular)
+   - Leaf size and proportions
+   - Venation pattern (parallel vs reticulate/net-veined)
+   - Stem characteristics visible (woody, herbaceous, color)
+   - Any flowers, fruits, or other distinguishing features visible
+
+2. KEY DISTINGUISHING FEATURES — do NOT confuse these:
+   - TOMATO: compound leaves with 5-9 irregularly lobed leaflets, strong tomato smell, hairy/glandular stems, serrated leaflet margins, reticulate venation
+   - SUGARCANE: long narrow strap-like leaves (60-150cm), parallel venation, prominent midrib, smooth waxy surface, grows from thick jointed stalks/canes
+   - POTATO: compound leaves similar to tomato but leaflets more oval/rounded
+   - PEPPER: simple ovate leaves, smooth, alternate arrangement
+   - CORN/MAIZE: long linear leaves, parallel venation, prominent midrib, alternate on thick stalk
+
+3. If the leaf has RETICULATE (net-like) venation → it is a DICOT (tomato, potato, pepper, etc.), NOT a monocot (sugarcane, corn, rice, wheat)
+4. If the leaf has PARALLEL venation → it is a MONOCOT (sugarcane, corn, rice, wheat), NOT a dicot
+5. Tomato and sugarcane look NOTHING alike — tomato has small compound serrated leaflets; sugarcane has long strap-shaped parallel-veined blades.
+6. NEVER guess. If uncertain about the crop, state your confidence level and the top 2-3 possibilities."""
+
+    user_prompt = f"""Analyze this plant leaf image carefully using the morphological identification protocol.
+Context/Metadata: {json.dumps(species_info)}
+
+STEP 1 — CROP IDENTIFICATION (most important):
+Examine the leaf morphology in detail (shape, margins, venation, texture, arrangement).
+Based ONLY on the visual evidence in the image, identify the exact crop/plant species.
+
+STEP 2 — DISEASE DIAGNOSIS:
+Once the crop is correctly identified, diagnose any disease or health issue.
+If healthy, state 'Healthy'.
+
+STEP 3 — AGRONOMIC ADVICE:
+Provide soil insights, water/irrigation guidance, and fertilizer recommendations specific to the CORRECTLY identified crop and its condition.
+
+Return ONLY valid JSON (no extra text, no markdown) in this exact structure:
+{{
+    "crop_name": "Exact name of the crop based on leaf morphology analysis",
+    "disease_name": "Specific disease name or 'Healthy'",
+    "description": "Detailed description including leaf morphology observations that led to crop identification, and the disease condition",
+    "solution": "Step-by-step treatment or care instructions specific to this crop and disease",
+    "fertilizers": "Specific fertilizer recommendations for this crop and condition",
+    "soil_insights": "Soil health insights (nutrients, pH, moisture) relevant to this crop",
+    "water_forecast": "Water and irrigation recommendations for this crop",
+    "risk_score": "Low/Medium/High"
+}}"""
 
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
@@ -508,9 +585,13 @@ def run_reasoning_model(image_bytes, species_info):
         "model": MODEL_NAME,
         "messages": [
             {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": user_prompt},
                     {
                         "type": "image_url",
                         "image_url": {
@@ -519,7 +600,9 @@ def run_reasoning_model(image_bytes, species_info):
                     }
                 ]
             }
-        ]
+        ],
+        "temperature": 0.1,
+        "top_p": 0.9,
     }
 
     response = requests.post(NVIDIA_API_URL, headers=headers, json=payload, timeout=6000)
@@ -554,7 +637,7 @@ def run_reasoning_model(image_bytes, species_info):
         return {"error": f"Reasoning model failed to parse output: {str(e)}", "raw_response": result}
 
 
-def _preprocess_image_for_api(image: Image.Image, max_side_px: int = 768, jpeg_quality: int = 82) -> bytes:
+def _preprocess_image_for_api(image: Image.Image, max_side_px: int = 1024, jpeg_quality: int = 90) -> bytes:
     """
     Speed optimization:
     - Convert to RGB
@@ -1198,7 +1281,7 @@ def shop_or_doctors_page(title, actor, lang_text):
 
     radius_km = st.slider(
         t("Search radius (km)"),
-        min_value=1, max_value=30, value=8,
+        min_value=1, max_value=50, value=15,
         key=f"{keyp}radius_km",
     )
     location = st.session_state.get("location", "").strip()
