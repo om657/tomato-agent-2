@@ -1,3 +1,6 @@
+
+
+
 import base64
 import io
 import json
@@ -8,6 +11,7 @@ import time
 
 import requests
 import streamlit as st
+from openai import OpenAI
 from matplotlib.backends.backend_pdf import PdfPages
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -17,13 +21,26 @@ from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
 
 # ================= CONFIG ================= #
-# API key intentionally kept in-code per requirement.
-NVIDIA_API_KEY = "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"
+# Paste your API keys directly below. No secrets.toml or environment variables needed.
+# Keep this file private and do not commit it to a public GitHub repository.
+NVIDIA_API_KEY = "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"
+SARVAM_API_KEY = "sk_w2ff5un8_NwCt6eC0gfgjKezrySpjUCKn"  # Optional: used for translation
+
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+REASONING_MODEL = "nvidia/nemotron-3.5-super-vl-120b-a12b"
 MODEL_NAME = "nvidia/nemotron-3.5-super-vl-120b-a12b"
-VISION_MODEL = "nvidia/nemotron-3.5-super-vl-120b-a12b"
-REASONING_MODEL = "deepseek-ai/deepseek-v4.1-flash"
-SARVAM_API_KEY = "sk_w2ff5un8_NwCt6eC0gfgjKezrySpjUCKn"
+VISION_MODEL = MODEL_NAME
+# Fallback models are tried if the primary model is unavailable on your account.
+TEXT_MODEL_FALLBACKS = [
+    "nvidia/nemotron-3.5-lightning-30b-a3b",
+    "mistralai/mistral-nemotron",
+    "meta/llama-3.3-70b-instruct",
+]
+VISION_MODEL_FALLBACKS = [
+    "nvidia/nemotron-3.5-super-vl-120b-a12b",
+    "meta/llama-3.2-11b-vision-instruct",
+    "meta/llama-3.2-90b-vision-instruct",
+]
 SARVAM_TRANSLATE_URL = "https://api.sarvam.ai/translate"
 USER_DB = "users.json"
 EXPORT_DIR = "exports"
@@ -146,9 +163,9 @@ def nearby_osm_places(lat: float, lon: float, actor: str, radius_m: int = 8000):
 def _run_osm_search(lat, lon, selectors, radius_m, actor):
     """Execute Overpass query and return filtered results."""
     q = (
-        "[out:json][timeout:25];("
-        + "".join(s.format(r=radius_m, lat=lat, lon=lon) for s in selectors)
-        + ");out center tags;"
+            "[out:json][timeout:25];("
+            + "".join(s.format(r=radius_m, lat=lat, lon=lon) for s in selectors)
+            + ");out center tags;"
     )
     try:
         data = _overpass_request(q, timeout_s=25)
@@ -306,19 +323,19 @@ def render_analysis_report(res: dict, location: str):
                     f"Risk: {risk}",
                     "",
                     "Assessment:",
-                    *( _as_lines(res.get("description")) ),
+                    *(_as_lines(res.get("description"))),
                     "",
                     "Prescription:",
-                    *( _as_lines(res.get("solution")) ),
+                    *(_as_lines(res.get("solution"))),
                     "",
                     "Soil:",
-                    *( _as_lines(res.get("soil_insights")) ),
+                    *(_as_lines(res.get("soil_insights"))),
                     "",
                     "Water:",
-                    *( _as_lines(res.get("water_forecast")) ),
+                    *(_as_lines(res.get("water_forecast"))),
                     "",
                     "Fertilizers:",
-                    *( _as_lines(res.get("fertilizers")) ),
+                    *(_as_lines(res.get("fertilizers"))),
                 ]
             ),
             file_name="analysis.txt",
@@ -357,9 +374,9 @@ def render_analysis_report(res: dict, location: str):
         st.subheader(t("Soil and Moisture Insights"))
         soil = res.get("soil_insights", "")
         if isinstance(soil, dict):
-            st.write(f"**{t('Nutrients')}**: {soil.get('nutrients','')}")
-            st.write(f"**{t('pH')}**: {soil.get('pH','')}")
-            st.write(f"**{t('Moisture')}**: {soil.get('moisture','')}")
+            st.write(f"**{t('Nutrients')}**: {soil.get('nutrients', '')}")
+            st.write(f"**{t('pH')}**: {soil.get('pH', '')}")
+            st.write(f"**{t('Moisture')}**: {soil.get('moisture', '')}")
         else:
             st.write(soil or t("No soil insights available."))
         st.markdown("</div>", unsafe_allow_html=True)
@@ -369,8 +386,8 @@ def render_analysis_report(res: dict, location: str):
         st.subheader(t("Water and Weather Outlook"))
         water = res.get("water_forecast", "")
         if isinstance(water, dict):
-            st.write(f"**{t('Forecast')}**: {water.get('forecast_next_7_days','')}")
-            st.write(f"**{t('Irrigation suggestions')}**: {water.get('irrigation_suggestions','')}")
+            st.write(f"**{t('Forecast')}**: {water.get('forecast_next_7_days', '')}")
+            st.write(f"**{t('Irrigation suggestions')}**: {water.get('irrigation_suggestions', '')}")
         else:
             st.write(water or t("No water forecast available."))
         st.markdown("</div>", unsafe_allow_html=True)
@@ -399,6 +416,7 @@ def render_analysis_report(res: dict, location: str):
             st.link_button(t("Search fertilizer suppliers"), url=f"https://www.google.com/search?q={q}")
 
         st.markdown("</div>", unsafe_allow_html=True)
+
 
 # ================= LANGUAGE / FONT ================= #
 TRANSLATIONS = {
@@ -495,31 +513,125 @@ ACTION_MAP = {
 }
 
 
+def _nvidia_chat_completion(messages, model_candidates, *, temperature=0.2, max_tokens=2048):
+    """Call NVIDIA's OpenAI-compatible API, using streaming and model fallbacks.
+
+    The app collects the visible assistant content for downstream processing.
+    NVIDIA reasoning tokens, when provided, are not displayed as user-facing
+    chain-of-thought; the final answer should contain the useful explanation.
+    """
+    if not NVIDIA_API_KEY or NVIDIA_API_KEY == "PASTE_YOUR_NVIDIA_API_KEY_HERE":
+        return {
+            "ok": False,
+            "error": (
+                "NVIDIA_API_KEY is not configured. Open app.py and replace "
+                "PASTE_YOUR_NVIDIA_API_KEY_HERE with your NVIDIA API key."
+            ),
+        }
+
+    # Same OpenAI-compatible NVIDIA endpoint as the user's original example.
+    client = OpenAI(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key=NVIDIA_API_KEY,
+        timeout=180.0,
+        max_retries=0,
+    )
+    candidates = list(dict.fromkeys(
+        m.strip() for m in model_candidates
+        if isinstance(m, str) and m.strip()
+    ))
+    if not candidates:
+        return {"ok": False, "error": "No NVIDIA model is configured."}
+
+    last_error = "Unknown NVIDIA API error"
+    for index, candidate in enumerate(candidates):
+        try:
+            stream = client.chat.completions.create(
+                model=candidate,
+                messages=messages,
+                temperature=temperature,
+                top_p=0.95,
+                max_tokens=max_tokens,
+                seed=42,
+                stream=True,
+                extra_body={
+                    "chat_template_kwargs": {"enable_thinking": True}
+                },
+            )
+            content_parts = []
+            for chunk in stream:
+                if not getattr(chunk, "choices", None):
+                    continue
+                delta = chunk.choices[0].delta
+                content = getattr(delta, "content", None)
+                if isinstance(content, str) and content:
+                    content_parts.append(content)
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            content_parts.append(part["text"])
+                        else:
+                            part_text = getattr(part, "text", None)
+                            if isinstance(part_text, str):
+                                content_parts.append(part_text)
+                # Do not expose internal reasoning_content to the UI.
+                # The final assistant content is used for the diagnosis/report.
+
+            answer = "".join(content_parts).strip()
+            if not answer:
+                return {
+                    "ok": False,
+                    "error": f"NVIDIA model '{candidate}' returned an empty response."
+                }
+            return {"ok": True, "content": answer, "model": candidate}
+
+        except Exception as exc:
+            status_code = getattr(exc, "status_code", None)
+            response = getattr(exc, "response", None)
+            response_text = ""
+            if response is not None:
+                try:
+                    response_text = response.text[:1200]
+                except Exception:
+                    response_text = ""
+            details = response_text or str(exc)
+            last_error = f"NVIDIA API error for model '{candidate}'"
+            if status_code:
+                last_error += f" (HTTP {status_code})"
+            last_error += f": {details[:1200]}"
+            body_lower = details.lower()
+            model_unavailable = (
+                    status_code in (404, 410, 422)
+                    or (status_code == 400 and any(
+                word in body_lower for word in (
+                    "model", "retired", "deprecated", "not found", "unavailable"
+                )
+            ))
+            )
+            if model_unavailable and index < len(candidates) - 1:
+                continue
+            if status_code == 401:
+                last_error += "\nCheck NVIDIA_API_KEY; rotate any key previously exposed in source code."
+            elif status_code == 403:
+                last_error += "\nYour key may not have access to this model or endpoint."
+            elif status_code == 429:
+                last_error += "\nRate limit or quota reached; check your NVIDIA account limits."
+            elif status_code in (404, 410):
+                last_error += "\nThe model endpoint is unavailable or retired. Select an active model in NVIDIA Build."
+            elif status_code is None:
+                last_error += "\nCheck network connectivity and ensure the 'openai' package is installed."
+            return {"ok": False, "error": last_error}
+
+    return {"ok": False, "error": last_error}
+
+
 def call_openrouter(messages, model=REASONING_MODEL):
-    headers = {
-        "Authorization": f"Bearer {NVIDIA_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {"model": model, "messages": messages}
-    try:
-        response = requests.post(NVIDIA_API_URL, headers=headers, json=payload, timeout=6000)
-        
-        # 🔥 Check status first
-        if response.status_code != 200:
-            return f"HTTP Error {response.status_code}: {response.text}"
-
-        # 🔥 Ensure JSON response
-        if "application/json" not in response.headers.get("Content-Type", ""):
-            return f"API returned non-JSON response:\n{response.text[:500]}"
-
-        data = response.json()
-        if "choices" in data:
-            return data["choices"][0]["message"]["content"]
-        if "error" in data:
-            return f"API Error: {data['error'].get('message')}"
-        return f"Unexpected format: {data}"
-    except requests.exceptions.RequestException as e:
-        return f"Network Error: {str(e)}"
+    """Backward-compatible wrapper used by existing app features (NVIDIA API)."""
+    candidates = [model] + TEXT_MODEL_FALLBACKS
+    result = _nvidia_chat_completion(messages, candidates, temperature=0.3, max_tokens=3000)
+    if result.get("ok"):
+        return result["content"]
+    return f"AI service error: {result.get('error', 'Unknown error')}"
 
 
 def run_reasoning_model(image_bytes, species_info):
@@ -576,65 +688,48 @@ Return ONLY valid JSON (no extra text, no markdown) in this exact structure:
     "risk_score": "Low/Medium/High"
 }}"""
 
-    headers = {
-        "Authorization": f"Bearer {NVIDIA_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+                },
+            ],
+        },
+    ]
+    result = _nvidia_chat_completion(
+        messages,
+        [VISION_MODEL] + VISION_MODEL_FALLBACKS,
+        temperature=0.1,
+        max_tokens=2500,
+    )
+    if not result.get("ok"):
+        return {"error": result.get("error", "Unknown vision model error")}
 
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}"
-                        }
-                    }
-                ]
-            }
-        ],
-        "temperature": 0.1,
-        "top_p": 0.9,
-    }
-
-    response = requests.post(NVIDIA_API_URL, headers=headers, json=payload, timeout=6000)
-    
-    if response.status_code != 200:
-        return {"error": f"HTTP Error {response.status_code}: {response.text}"}
-
-    if "application/json" not in response.headers.get("Content-Type", ""):
-        return {"error": "API returned non-JSON response", "raw": response.text[:500]}
+    output_text = result["content"]
+    # Strip common Markdown fences before parsing the model's JSON response.
+    if output_text.startswith("```"):
+        lines = output_text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        output_text = "\n".join(lines).strip()
 
     try:
-        result = response.json()
-    except requests.exceptions.JSONDecodeError:
-         return {"error": "Failed to decode JSON", "raw": response.text[:500]}
-
-    if "choices" not in result:
-        err_msg = "Unknown error"
-        if "error" in result:
-            err_msg = result["error"].get("message", "Unknown error")
-        return {"error": f"API Error: {err_msg}", "raw_response": result}
-
-    try:
-        output_text = result["choices"][0]["message"]["content"]
-        # Remove markdown code blocks if present
-        if "```json" in output_text:
-            output_text = output_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in output_text:
-            output_text = output_text.split("```")[1].split("```")[0].strip()
-            
-        return json.loads(output_text)
-    except Exception as e:
-        return {"error": f"Reasoning model failed to parse output: {str(e)}", "raw_response": result}
+        parsed = json.loads(output_text)
+        if isinstance(parsed, dict):
+            return parsed
+        return {"error": "Vision model returned JSON, but it was not an object.", "raw_response": output_text}
+    except ValueError:
+        return {
+            "error": "Vision model returned text that could not be parsed as JSON.",
+            "raw_response": output_text[:2500],
+        }
 
 
 def _preprocess_image_for_api(image: Image.Image, max_side_px: int = 1024, jpeg_quality: int = 90) -> bytes:
@@ -799,6 +894,9 @@ def translate_text(text, language):
     if not stripped:
         return text
 
+    if not SARVAM_API_KEY or SARVAM_API_KEY == "PASTE_YOUR_SARVAM_API_KEY_HERE":
+        return text  # Translation is optional; keep the original English text.
+
     headers = {
         "api-subscription-key": SARVAM_API_KEY,
         "content-type": "application/json",
@@ -821,10 +919,10 @@ def translate_text(text, language):
         return text
 
     translated = (
-        data.get("translated_text")
-        or data.get("translation")
-        or data.get("output")
-        or data.get("data", {}).get("translated_text")
+            data.get("translated_text")
+            or data.get("translation")
+            or data.get("output")
+            or data.get("data", {}).get("translated_text")
     )
     return translated if isinstance(translated, str) and translated.strip() else text
 
@@ -853,7 +951,7 @@ def run_all_background_tasks():
     while st.session_state.task_queue:
         task = st.session_state.task_queue.pop(0)
         st.session_state.agent_status = f"Running: {task['task']}"
-        
+
         report = call_openrouter(
             [
                 {
@@ -942,7 +1040,7 @@ def sidebar_controls(lang_text):
         # Language selection with Apply button
         current_lang_idx = list(TRANSLATIONS.keys()).index(st.session_state.language)
         new_lang = st.selectbox(t("Select Language"), list(TRANSLATIONS.keys()), index=current_lang_idx)
-        
+
         if st.button(t("Apply Language")):
             st.session_state.language = new_lang
             st.rerun()
@@ -1004,7 +1102,7 @@ def sidebar_controls(lang_text):
             if st.button(t("Run analysis")):
                 queue_task(selected_action, ACTION_MAP[selected_action])
                 st.success(f"{t('Queued')}: {t(selected_action)}")
-        
+
         with col2:
             if st.button(t("Do all analysis")):
                 for action, prompt in ACTION_MAP.items():
@@ -1043,13 +1141,13 @@ def sidebar_controls(lang_text):
 def home_page(lang_text):
     st.title(t("Agricultural Super AI Agent"))
     st.session_state.location = st.text_input(t("Farm location"), value=st.session_state.location)
-    location = st.session_state.location # Local reference
+    location = st.session_state.location  # Local reference
     uploaded_image = st.file_uploader(lang_text["upload"], type=["jpg", "jpeg", "png"])
 
     if uploaded_image:
         image = Image.open(uploaded_image)
         st.image(image, caption="Uploaded Leaf", use_container_width=True)
-        
+
         if st.button(lang_text["analyze"]):
             # Fast path:
             # - preprocess image to reduce upload size (huge speedup)
@@ -1062,7 +1160,7 @@ def home_page(lang_text):
             result = analyze_leaf_cached(img_bytes, location)
             status.update(label=t("Done"), state="complete")
             st.session_state.detection_result = result
-            
+
             if "error" not in result:
                 st.success(t("Analysis Complete!"))
             else:
@@ -1075,10 +1173,10 @@ def home_page(lang_text):
 
 def chat_page():
     st.title(t("Agent Chat"))
-    
+
     # Chat container for scrollable messages
     chat_container = st.container()
-    
+
     with chat_container:
         for msg in st.session_state.chat_history:
             with st.chat_message(msg['role']):
@@ -1289,7 +1387,8 @@ def shop_or_doctors_page(title, actor, lang_text):
         st.info(t("Tip: set your Farm location on Home page for nearby results."))
 
     # Auto-search on button click (fast, cached)
-    if st.button(f"🔍 {t('Search nearby on map')}", key=f"{keyp}show_nearby_map", type="primary", use_container_width=True):
+    if st.button(f"🔍 {t('Search nearby on map')}", key=f"{keyp}show_nearby_map", type="primary",
+                 use_container_width=True):
         if not location:
             st.error(t("Farm location is empty. Please set it on Home page."))
         else:
@@ -1324,7 +1423,7 @@ def shop_or_doctors_page(title, actor, lang_text):
 
     # Tomato fertilizer hint
     if is_shop and crop.strip().lower() in {"tomato", "tomatoes"} and (
-        "fert" in requirement.strip().lower() or requirement.strip() == ""
+            "fert" in requirement.strip().lower() or requirement.strip() == ""
     ):
         with st.expander(t("🍅 Tomato fertilizer requirements"), expanded=False):
             st.markdown(tomato_fertilizer_plan_text())
@@ -1425,7 +1524,7 @@ def main():
                 est = est.split("```json")[1].split("```")[0].strip()
             elif "```" in est:
                 est = est.split("```")[1].split("```")[0].strip()
-            
+
             est_json = json.loads(est)
         except:
             st.write(t("Could not parse estimation. Raw output:"))
@@ -1435,22 +1534,22 @@ def main():
         if est_json:
             est_json = translate_result_data(est_json, st.session_state.language)
             st.write(f"### {t('Local Market Price')}")
-            st.write(est_json.get("market_price","N/A"))
+            st.write(est_json.get("market_price", "N/A"))
 
             st.write(f"### {t('Price Trend and Best Months')}")
-            st.write(est_json.get("price_trend",""))
+            st.write(est_json.get("price_trend", ""))
             st.write(f"{t('Best Months to Sell')}: {est_json.get('best_months', [])}")
 
             st.write(f"### {t('Cost and Revenue Breakdown')}")
-            st.write(f"{t('Total Production Cost')}: {est_json.get('total_cost','')}")
-            st.write(f"{t('Expected Revenue')}: {est_json.get('expected_revenue','')}")
-            st.write(f"{t('Profit or Loss')}: {est_json.get('profit_or_loss','')}")
+            st.write(f"{t('Total Production Cost')}: {est_json.get('total_cost', '')}")
+            st.write(f"{t('Expected Revenue')}: {est_json.get('expected_revenue', '')}")
+            st.write(f"{t('Profit or Loss')}: {est_json.get('profit_or_loss', '')}")
 
             st.write(f"### {t('Travel Costs')}")
-            st.write(est_json.get("travel_costs",""))
+            st.write(est_json.get("travel_costs", ""))
 
             st.write(f"### {t('Recommendation')}")
-            st.info(est_json.get("recommendation",""))
+            st.info(est_json.get("recommendation", ""))
 
     show_reports_panel()
 
