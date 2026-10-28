@@ -20,9 +20,9 @@ from geopy.distance import geodesic
 # API key intentionally kept in-code per requirement.
 NVIDIA_API_KEY = "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"
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-MODEL_NAME = "mistralai/mistral-large-3-675b-instruct-2512"
-VISION_MODEL = "mistralai/mistral-large-3-675b-instruct-2512"
-REASONING_MODEL = "deepseek-ai/deepseek-v4-flash"
+MODEL_NAME = "mistralai/mistral-medium-3.5-128b"
+VISION_MODEL = "nvidia/nemotron-3.5-super-vl-120b-a12b"
+REASONING_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
 SARVAM_API_KEY = "sk_w2ff5un8_NwCt6eC0gfgjKezrySpjUCKn"
 SARVAM_TRANSLATE_URL = "https://api.sarvam.ai/translate"
 USER_DB = "users.json"
