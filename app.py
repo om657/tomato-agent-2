@@ -1,6 +1,4 @@
 
-
-
 import base64
 import io
 import json
@@ -25,7 +23,6 @@ from geopy.distance import geodesic
 # Keep this file private and do not commit it to a public GitHub repository.
 NVIDIA_API_KEY = "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"
 SARVAM_API_KEY = "sk_w2ff5un8_NwCt6eC0gfgjKezrySpjUCKn"  # Optional: used for translation
-
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 REASONING_MODEL = "nvidia/nemotron-3.5-super-vl-120b-a12b"
 MODEL_NAME = "nvidia/nemotron-3.5-super-vl-120b-a12b"
@@ -118,17 +115,19 @@ def nearby_osm_places(lat: float, lon: float, actor: str, radius_m: int = 8000):
     if actor.lower().startswith("shop"):
         # Search ALL shops + marketplaces + any node with agriculture-ish name
         selectors = [
-            # ALL shops in the area (any type)
-            'node["shop"](around:{r},{lat},{lon});',
-            'way["shop"](around:{r},{lat},{lon});',
-            # Marketplaces / mandis
+            # Agriculture-specific shops first; OSM coverage varies by region.
+            'node["shop"="agrarian"](around:{r},{lat},{lon});',
+            'way["shop"="agrarian"](around:{r},{lat},{lon});',
+            'node["shop"="farm"](around:{r},{lat},{lon});',
+            'way["shop"="farm"](around:{r},{lat},{lon});',
+            'node["shop"="seeds"](around:{r},{lat},{lon});',
+            'way["shop"="seeds"](around:{r},{lat},{lon});',
+            'node["shop"="garden_centre"](around:{r},{lat},{lon});',
+            'way["shop"="garden_centre"](around:{r},{lat},{lon});',
+            'node["shop"="chemical"](around:{r},{lat},{lon});',
+            'way["shop"="chemical"](around:{r},{lat},{lon});',
             'node["amenity"="marketplace"](around:{r},{lat},{lon});',
             'way["amenity"="marketplace"](around:{r},{lat},{lon});',
-            # Craft / trade
-            'node["craft"](around:{r},{lat},{lon});',
-            'way["craft"](around:{r},{lat},{lon});',
-            # Landuse retail
-            'way["landuse"="retail"](around:{r},{lat},{lon});',
         ]
     else:
         # Search ALL medical facilities
@@ -1382,9 +1381,15 @@ def shop_or_doctors_page(title, actor, lang_text):
         min_value=1, max_value=50, value=15,
         key=f"{keyp}radius_km",
     )
-    location = st.session_state.get("location", "").strip()
-    if not location:
-        st.info(t("Tip: set your Farm location on Home page for nearby results."))
+    saved_location = str(st.session_state.get("location", "") or "").strip()
+    # Let users enter a location directly here as well as on the Home page.
+    location = st.text_input(
+        "Farm location (village, city, district)",
+        value=saved_location,
+        key=f"{keyp}nearby_location_input",
+        placeholder="e.g. Baramati, Pune, Maharashtra",
+        help="Use a specific village/town and district for better nearby results.",
+    ).strip()
 
     # Auto-search on button click (fast, cached)
     if st.button(f"🔍 {t('Search nearby on map')}", key=f"{keyp}show_nearby_map", type="primary",
@@ -1428,27 +1433,35 @@ def shop_or_doctors_page(title, actor, lang_text):
         with st.expander(t("🍅 Tomato fertilizer requirements"), expanded=False):
             st.markdown(tomato_fertilizer_plan_text())
 
-    # AI Search buttons
+    # Search buttons use the same real business dataset. Never fabricate business names,
+    # telephone numbers, prices, or availability with an LLM.
     st.markdown("---")
     col1, col2 = st.columns(2)
     with col1:
-        if st.button(f"🤖 {t('AI Search')} {t(actor)}", key=f"{keyp}ai_search", use_container_width=True):
-            with st.spinner(f"⚡ {t('Finding the best options for you...')}"):
-                loc = st.session_state.get('location', 'unknown location')
-                search_prompt = f"As an agricultural AI, find/recommend 5 {actor.lower()}s or services for {crop} with requirement: {requirement} near {loc}. Provide name, contact detail (simulated), and specialized service. Format as a clean list."
-                response = call_openrouter([{"role": "user", "content": search_prompt}])
-                if "error" not in response.lower() or "401" not in response:
-                    st.success(f"{t('Found')} {t(actor)}!")
-                    st.markdown(t(response))
-                else:
-                    st.error(f"{t('Search failed')}: {t(response)}")
+        if st.button(f"🔎 Search real {t(actor)} listings", key=f"{keyp}ai_search", use_container_width=True):
+            if not location:
+                st.error("Enter your farm location above first (village/town + district).")
+            else:
+                st.session_state[f"{keyp}nearby_search_trigger"] = True
+                st.rerun()
 
     with col2:
-        if st.button(f"📋 {t('Show all nearby')}", key=f"{keyp}ai_show_all", use_container_width=True):
-            with st.spinner(t("Listing all major options...")):
-                search_prompt = f"List all major {actor.lower()} options for {crop} farming. Include pricing estimates and usage summary."
-                response = call_openrouter([{"role": "user", "content": search_prompt}])
-                st.markdown(t(response))
+        if st.button(f"📋 Show all nearby", key=f"{keyp}ai_show_all", use_container_width=True):
+            if not location:
+                st.error("Enter your farm location above first (village/town + district).")
+            else:
+                with st.spinner("Searching real OpenStreetMap listings..."):
+                    geo = geocode_location_osm(location)
+                    if not geo:
+                        st.error("Location not found. Add village/town, district, and state.")
+                    else:
+                        lat, lon, display_name = geo
+                        places = nearby_osm_places(lat, lon, actor, radius_m=int(radius_km * 1000))
+                        st.success(f"Found {len(places)} mapped listings near {display_name}.")
+                        if places:
+                            _render_place_cards(places, actor)
+                        else:
+                            st.info("No mapped listings found. Try a larger radius or a more specific nearby town.")
 
 
 def contact_page():
