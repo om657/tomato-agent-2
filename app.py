@@ -18,7 +18,7 @@ from geopy.distance import geodesic
 
 # ================= CONFIG ================= #
 # API key intentionally kept in-code per requirement.
-NVIDIA_API_KEY = "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"
+NVIDIA_API_KEY = "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"
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 MODEL_NAME = "mistralai/mistral-large-3-675b-instruct-2512"
 VISION_MODEL = "mistralai/mistral-large-3-675b-instruct-2512"
