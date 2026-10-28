@@ -7,3 +7,11 @@ geopy
 matplotlib
 pandas
 python-dateutil
+streamlit
+requests
+openai
+matplotlib
+pillow
+folium
+streamlit-folium
+geopy
